@@ -25,6 +25,7 @@ from botocore.exceptions import (
     ServiceNotInRegionError,
     UnknownServiceError,
 )
+from cohere import ChatMessage
 
 from core.model_runtime.entities.llm_entities import LLMResult, LLMResultChunk, LLMResultChunkDelta, LLMUsage
 from core.model_runtime.entities.message_entities import (
@@ -48,6 +49,7 @@ from core.model_runtime.errors.invoke import (
 )
 from core.model_runtime.errors.validate import CredentialsValidateFailedError
 from core.model_runtime.model_providers.__base.large_language_model import LargeLanguageModel
+from core.model_runtime.model_providers.cohere.llm.llm import CohereLargeLanguageModel
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +77,86 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         # invoke anthropic models via anthropic official SDK
         if "anthropic" in model:
             return self._generate_anthropic(model, credentials, prompt_messages, model_parameters, stop, stream, user)
+        # invoke Cohere models via boto3 client
+        if "cohere.command-r" in model:
+            return self._generate_cohere_chat(model, credentials, prompt_messages, model_parameters, stop, stream, user, tools)
         # invoke other models via boto3 client
         return self._generate(model, credentials, prompt_messages, model_parameters, stop, stream, user)
+    
+    def _generate_cohere_chat(
+            self, model: str, credentials: dict, prompt_messages: list[PromptMessage], model_parameters: dict,
+            stop: Optional[list[str]] = None, stream: bool = True, user: Optional[str] = None,
+            tools: Optional[list[PromptMessageTool]] = None,) -> Union[LLMResult, Generator]:
+        cohere_llm = CohereLargeLanguageModel()
+        client_config = Config(
+            region_name=credentials["aws_region"]
+        )
+
+        runtime_client = boto3.client(
+            service_name='bedrock-runtime',
+            config=client_config,
+            aws_access_key_id=credentials["aws_access_key_id"],
+            aws_secret_access_key=credentials["aws_secret_access_key"]
+        )
+
+        extra_model_kwargs = {}
+        if stop:
+            extra_model_kwargs['stop_sequences'] = stop
+
+        if tools:
+            tools = cohere_llm._convert_tools(tools)
+            model_parameters['tools'] = tools
+
+        message, chat_histories, tool_results \
+            = cohere_llm._convert_prompt_messages_to_message_and_chat_histories(prompt_messages)
+
+        if tool_results:
+            model_parameters['tool_results'] = tool_results
+
+        payload = {
+            **model_parameters,
+            "message": message,
+            "chat_history": chat_histories,
+        }
+
+        # need workaround for ai21 models which doesn't support streaming
+        if stream:
+            invoke = runtime_client.invoke_model_with_response_stream
+        else:
+            invoke = runtime_client.invoke_model
+
+        def serialize(obj):
+            if isinstance(obj, ChatMessage):
+                return obj.__dict__
+            raise TypeError(f"Type {type(obj)} not serializable")
+
+        try:
+            body_jsonstr=json.dumps(payload, default=serialize)
+            response = invoke(
+                modelId=model,
+                contentType="application/json",
+                accept="*/*",
+                body=body_jsonstr
+            )
+        except ClientError as ex:
+            error_code = ex.response['Error']['Code']
+            full_error_msg = f"{error_code}: {ex.response['Error']['Message']}"
+            raise self._map_client_to_invoke_error(error_code, full_error_msg)
+
+        except (EndpointConnectionError, NoRegionError, ServiceNotInRegionError) as ex:
+            raise InvokeConnectionError(str(ex))
+
+        except UnknownServiceError as ex:
+            raise InvokeServerUnavailableError(str(ex))
+
+        except Exception as ex:
+            raise InvokeError(str(ex))
+
+        if stream:
+            return self._handle_generate_stream_response(model, credentials, response, prompt_messages)
+
+        return self._handle_generate_response(model, credentials, response, prompt_messages)
+
 
     def _generate_anthropic(self, model: str, credentials: dict, prompt_messages: list[PromptMessage], model_parameters: dict,
                 stop: Optional[list[str]] = None, stream: bool = True, user: Optional[str] = None) -> Union[LLMResult, Generator]:
@@ -95,8 +175,8 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         # - https://docs.anthropic.com/claude/reference/claude-on-amazon-bedrock
         # - https://github.com/anthropics/anthropic-sdk-python
         client = AnthropicBedrock(
-            aws_access_key=credentials["aws_access_key_id"],
-            aws_secret_key=credentials["aws_secret_access_key"],
+            aws_access_key=credentials.get("aws_access_key_id"),
+            aws_secret_key=credentials.get("aws_secret_access_key"),
             aws_region=credentials["aws_region"],
         )
 
@@ -358,41 +438,25 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
 
         return message_dict
 
-    def get_num_tokens(self, model: str, credentials: dict, messages: list[PromptMessage] | str,
+    def get_num_tokens(self, model: str, credentials: dict, prompt_messages: list[PromptMessage] | str,
                        tools: Optional[list[PromptMessageTool]] = None) -> int:
         """
         Get number of tokens for given prompt messages
 
         :param model: model name
         :param credentials: model credentials
-        :param messages: prompt messages or message string
+        :param prompt_messages: prompt messages or message string
         :param tools: tools for tool calling
         :return:md = genai.GenerativeModel(model)
         """
         prefix = model.split('.')[0]
-
-        if isinstance(messages, str):
-            prompt = messages
+        model_name = model.split('.')[1]
+        if isinstance(prompt_messages, str):
+            prompt = prompt_messages
         else:
-            prompt = self._convert_messages_to_prompt(messages, prefix)
+            prompt = self._convert_messages_to_prompt(prompt_messages, prefix, model_name)
 
         return self._get_num_tokens_by_gpt2(prompt)
-    
-    def _convert_messages_to_prompt(self, model_prefix: str, messages: list[PromptMessage]) -> str:
-        """
-        Format a list of messages into a full prompt for the Google model
-
-        :param messages: List of PromptMessage to combine.
-        :return: Combined string with necessary human_prompt and ai_prompt tags.
-        """
-        messages = messages.copy()  # don't mutate the original list
-        
-        text = "".join(
-            self._convert_one_message_to_text(message, model_prefix)
-            for message in messages
-        )
-
-        return text.rstrip()
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
@@ -432,7 +496,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         except Exception as ex:
             raise CredentialsValidateFailedError(str(ex))
 
-    def _convert_one_message_to_text(self, message: PromptMessage, model_prefix: str) -> str:
+    def _convert_one_message_to_text(self, message: PromptMessage, model_prefix: str, model_name: Optional[str] = None) -> str:
         """
         Convert a single message to a string.
 
@@ -446,9 +510,21 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             ai_prompt = "\n\nAssistant:"
 
         elif model_prefix == "meta":
-            human_prompt_prefix = "\n[INST]"
+            # LLAMA3
+            if model_name.startswith("llama3"):
+                human_prompt_prefix = "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+                human_prompt_postfix = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                ai_prompt = "\n\nAssistant:"
+            else:
+                # LLAMA2
+                human_prompt_prefix = "\n[INST]"
+                human_prompt_postfix = "[\\INST]\n"
+                ai_prompt = ""
+
+        elif model_prefix == "mistral":
+            human_prompt_prefix = "<s>[INST]"
             human_prompt_postfix = "[\\INST]\n"
-            ai_prompt = ""
+            ai_prompt = "\n\nAssistant:"
 
         elif model_prefix == "amazon":
             human_prompt_prefix = "\n\nUser:"
@@ -473,11 +549,12 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
 
         return message_text
 
-    def _convert_messages_to_prompt(self, messages: list[PromptMessage], model_prefix: str) -> str:
+    def _convert_messages_to_prompt(self, messages: list[PromptMessage], model_prefix: str, model_name: Optional[str] = None) -> str:
         """
         Format a list of messages into a full prompt for the Anthropic, Amazon and Llama models
 
         :param messages: List of PromptMessage to combine.
+        :param model_name: specific model name.Optional,just to distinguish llama2 and llama3
         :return: Combined string with necessary human_prompt and ai_prompt tags.
         """
         if not messages:
@@ -488,18 +565,20 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             messages.append(AssistantPromptMessage(content=""))
 
         text = "".join(
-            self._convert_one_message_to_text(message, model_prefix)
+            self._convert_one_message_to_text(message, model_prefix, model_name)
             for message in messages
         )
 
         # trim off the trailing ' ' that might come from the "Assistant: "
         return text.rstrip()
 
-    def _create_payload(self, model_prefix: str, prompt_messages: list[PromptMessage], model_parameters: dict, stop: Optional[list[str]] = None, stream: bool = True):
+    def _create_payload(self, model: str, prompt_messages: list[PromptMessage], model_parameters: dict, stop: Optional[list[str]] = None, stream: bool = True):
         """
         Create payload for bedrock api call depending on model provider
         """
-        payload = dict()
+        payload = {}
+        model_prefix = model.split('.')[0]
+        model_name = model.split('.')[1]
 
         if model_prefix == "amazon":
             payload["textGenerationConfig"] = { **model_parameters }
@@ -519,6 +598,13 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 payload["frequencyPenalty"] = {model_parameters.get("frequencyPenalty")}
             if model_parameters.get("countPenalty"):
                 payload["countPenalty"] = {model_parameters.get("countPenalty")}
+        
+        elif model_prefix == "mistral":
+            payload["temperature"] = model_parameters.get("temperature")
+            payload["top_p"] = model_parameters.get("top_p")
+            payload["max_tokens"] = model_parameters.get("max_tokens")
+            payload["prompt"] = self._convert_messages_to_prompt(prompt_messages, model_prefix)
+            payload["stop"] = stop[:10] if stop else []
 
         elif model_prefix == "anthropic":
             payload = { **model_parameters }
@@ -532,7 +618,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         
         elif model_prefix == "meta":
             payload = { **model_parameters }
-            payload["prompt"] = self._convert_messages_to_prompt(prompt_messages, model_prefix)
+            payload["prompt"] = self._convert_messages_to_prompt(prompt_messages, model_prefix, model_name)
 
         else:
             raise ValueError(f"Got unknown model prefix {model_prefix}")
@@ -562,12 +648,12 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         runtime_client = boto3.client(
             service_name='bedrock-runtime',
             config=client_config,
-            aws_access_key_id=credentials["aws_access_key_id"],
-            aws_secret_access_key=credentials["aws_secret_access_key"]
+            aws_access_key_id=credentials.get("aws_access_key_id"),
+            aws_secret_access_key=credentials.get("aws_secret_access_key")
         )
 
         model_prefix = model.split('.')[0]
-        payload = self._create_payload(model_prefix, prompt_messages, model_parameters, stop, stream)
+        payload = self._create_payload(model, prompt_messages, model_parameters, stop, stream)
 
         # need workaround for ai21 models which doesn't support streaming
         if stream and model_prefix != "ai21":
@@ -648,6 +734,11 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             output = response_body.get("generation").strip('\n')
             prompt_tokens = response_body.get("prompt_token_count")
             completion_tokens = response_body.get("generation_token_count")
+        
+        elif model_prefix == "mistral":
+            output = response_body.get("outputs")[0].get("text")
+            prompt_tokens = response.get('ResponseMetadata').get('HTTPHeaders').get('x-amzn-bedrock-input-token-count')
+            completion_tokens = response.get('ResponseMetadata').get('HTTPHeaders').get('x-amzn-bedrock-output-token-count')
 
         else:
             raise ValueError(f"Got unknown model prefix {model_prefix} when handling block response")
@@ -731,6 +822,10 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 content_delta = payload.get("text")
                 finish_reason = payload.get("finish_reason")
             
+            elif model_prefix == "mistral":
+                content_delta = payload.get('outputs')[0].get("text")
+                finish_reason = payload.get('outputs')[0].get("stop_reason")
+
             elif model_prefix == "meta":
                 content_delta = payload.get("generation").strip('\n')
                 finish_reason = payload.get("stop_reason")
