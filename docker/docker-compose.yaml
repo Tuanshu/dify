@@ -248,7 +248,7 @@ services:
       SENTRY_DSN: ''
     # uncomment to expose dify-web port to host
     # ports:
-    #   - "3000:3000"
+    #   - "6607:3000"
 
   # The postgres database.
   db:
@@ -266,7 +266,7 @@ services:
       - ./volumes/db/data:/var/lib/postgresql/data
     # uncomment to expose db(postgresql) port to host
     # ports:
-    #   - "5432:5432"
+    #   - "6608:5432"
     healthcheck:
       test: [ "CMD", "pg_isready" ]
       interval: 1s
@@ -353,5 +353,5 @@ services:
       - api
       - web
     ports:
-      - "80:80"
+      - "6607:80"
       #- "443:443"
